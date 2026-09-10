@@ -167,17 +167,25 @@ async fn fetch_one(
         }
     };
 
+    // mihomo parity (component/http/http.go): a user-supplied User-Agent
+    // replaces the built-in one instead of duplicating the field line.
+    let has_custom_ua = headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"));
     let mut request = format!(
         "GET {path} HTTP/1.1\r\n\
          Host: {host_header}\r\n\
-         User-Agent: {ua}\r\n\
          Accept: */*\r\n\
          Accept-Encoding: identity\r\n\
          Connection: close\r\n",
         path = path_and_query,
         host_header = host_header(&host, port, is_https),
-        ua = USER_AGENT,
     );
+    if !has_custom_ua {
+        request.push_str("User-Agent: ");
+        request.push_str(USER_AGENT);
+        request.push_str("\r\n");
+    }
     for (name, value) in headers {
         if name.is_empty()
             || name.bytes().any(|b| b == b'\r' || b == b'\n' || b == b':')

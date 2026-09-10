@@ -1193,6 +1193,7 @@ mod tests {
                     path: None,
                     interval: None,
                     proxy: None,
+                    header: None,
                     payload: Some(payload.clone()),
                 },
             );

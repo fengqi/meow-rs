@@ -45,6 +45,16 @@ impl std::fmt::Display for ProviderType {
     }
 }
 
+/// HTTP fetch context for http providers, captured at load time and reused
+/// on every periodic `refresh()`: the download proxy (`None` = direct) and
+/// the flattened custom request headers (name-sorted; one entry per value,
+/// so multi-value headers repeat the name — RFC 9110 §5.2).
+#[derive(Default)]
+struct FetchContext {
+    proxy: Option<Arc<dyn Proxy>>,
+    headers: Vec<(String, String)>,
+}
+
 /// A loaded rule-provider. Cheap to share via `Arc`; rule-set reads are
 /// protected by a short-held `RwLock` (just a pointer swap on write);
 /// refresh parse work runs on a blocking thread (ADR-0008 §7 sub-area 3).
@@ -59,9 +69,7 @@ pub struct RuleProvider {
     /// Unix timestamp (seconds) of last successful load/refresh.
     updated_at: AtomicU,
     rules: RwLock<Arc<dyn RuleSet>>,
-    /// Upstream proxy to route HTTP fetches through. `None` = direct.
-    /// Captured at load time; reused on every periodic `refresh()`.
-    download_proxy: Option<Arc<dyn Proxy>>,
+    fetch: FetchContext,
 }
 
 impl std::fmt::Debug for RuleProvider {
@@ -99,7 +107,12 @@ impl RuleProvider {
         if self.provider_type != ProviderType::Http {
             return Ok(());
         }
-        let bytes = fetch_http_async(&self.vehicle, self.download_proxy.as_ref()).await?;
+        let bytes = fetch_http_async(
+            &self.vehicle,
+            self.fetch.proxy.as_ref(),
+            &self.fetch.headers,
+        )
+        .await?;
         let behavior = self.behavior;
         let ctx_clone = ctx.clone();
         let boxed: Box<dyn RuleSet> = crate::spawn_blocking_with_current_dispatcher(move || {
@@ -219,11 +232,13 @@ fn read_payload_bytes(
                 .ok_or_else(|| anyhow!("http provider '{name}' requires a 'url'"))?;
             let cache_path = resolve_path(cfg, cache_dir, name, false)?;
             let prefer_cache = cfg.interval.unwrap_or(0) > 0;
+            let headers = provider_headers(cfg);
             let bytes = fetch_http_blocking_with_cache(
                 url,
                 cache_path.as_deref(),
                 download_proxy,
                 prefer_cache,
+                &headers,
             )?;
             Ok(Some(bytes))
         }
@@ -359,7 +374,7 @@ fn load_inline(
         String::new(),
         0,
         rules,
-        None,
+        FetchContext::default(),
     ))
 }
 
@@ -395,7 +410,7 @@ fn load_file(
         vehicle,
         0,
         rules,
-        None,
+        FetchContext::default(),
     ))
 }
 
@@ -415,6 +430,7 @@ fn load_http(
     let cache_path = resolve_path(cfg, cache_dir, name, false)?;
     let explicit_format = parse_explicit_format(cfg)?;
     let interval = cfg.interval.unwrap_or(0);
+    let headers = provider_headers(cfg);
     let bytes = match prefetched {
         Some(b) => b.to_vec(),
         None => fetch_http_blocking_with_cache(
@@ -422,6 +438,7 @@ fn load_http(
             cache_path.as_deref(),
             download_proxy,
             interval > 0,
+            &headers,
         )?,
     };
     let rules = parse_bytes_to_ruleset_with_format(&bytes, behavior, explicit_format, ctx)?;
@@ -432,7 +449,10 @@ fn load_http(
         url.to_string(),
         interval,
         rules,
-        download_proxy.cloned(),
+        FetchContext {
+            proxy: download_proxy.cloned(),
+            headers,
+        },
     ))
 }
 
@@ -443,7 +463,7 @@ fn make_provider(
     vehicle: String,
     interval: u64,
     rules: Box<dyn RuleSet>,
-    download_proxy: Option<Arc<dyn Proxy>>,
+    fetch: FetchContext,
 ) -> RuleProvider {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -458,8 +478,16 @@ fn make_provider(
         interval,
         updated_at: AtomicU::new(now as meow_common::atomic::Uint),
         rules: RwLock::new(rules_arc),
-        download_proxy,
+        fetch,
     }
+}
+
+/// Flattened `header:` pairs for one provider; empty when none declared.
+fn provider_headers(cfg: &RawRuleProvider) -> Vec<(String, String)> {
+    cfg.header
+        .as_ref()
+        .map(crate::raw::flatten_header_map)
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -622,6 +650,7 @@ fn fetch_http_blocking_with_cache(
     cache_path: Option<&Path>,
     proxy: Option<&Arc<dyn Proxy>>,
     prefer_cache: bool,
+    headers: &[(String, String)],
 ) -> Result<Vec<u8>> {
     if prefer_cache {
         if let Some(path) = cache_path {
@@ -633,7 +662,7 @@ fn fetch_http_blocking_with_cache(
         }
     }
 
-    match fetch_http_blocking(url, proxy) {
+    match fetch_http_blocking(url, proxy, headers) {
         Ok(bytes) => {
             if let Some(path) = cache_path {
                 write_cache(path, &bytes);
@@ -657,16 +686,21 @@ fn fetch_http_blocking_with_cache(
     }
 }
 
-fn fetch_http_blocking(url: &str, proxy: Option<&Arc<dyn Proxy>>) -> Result<Vec<u8>> {
+fn fetch_http_blocking(
+    url: &str,
+    proxy: Option<&Arc<dyn Proxy>>,
+    headers: &[(String, String)],
+) -> Result<Vec<u8>> {
     let url = url.to_string();
     let thread_url = url.clone();
     let proxy = proxy.cloned();
+    let headers = headers.to_vec();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .context("building temporary tokio runtime for rule-provider fetch")?;
-        rt.block_on(fetch_http_async(&thread_url, proxy.as_ref()))
+        rt.block_on(fetch_http_async(&thread_url, proxy.as_ref(), &headers))
     })
     .join()
     .map_err(|payload| {
@@ -688,8 +722,12 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-pub(crate) async fn fetch_http_async(url: &str, proxy: Option<&Arc<dyn Proxy>>) -> Result<Vec<u8>> {
-    internal_http::fetch(url, proxy, &[]).await
+pub(crate) async fn fetch_http_async(
+    url: &str,
+    proxy: Option<&Arc<dyn Proxy>>,
+    headers: &[(String, String)],
+) -> Result<Vec<u8>> {
+    internal_http::fetch(url, proxy, headers).await
 }
 
 fn write_cache(path: &Path, bytes: &[u8]) {
@@ -738,6 +776,7 @@ mod tests {
             path: None,
             interval: None,
             proxy: proxy.map(str::to_string),
+            header: None,
             payload: None,
         }
     }
@@ -812,6 +851,7 @@ mod tests {
                 path: Some(file_path.to_string_lossy().to_string()),
                 interval: None,
                 proxy: Some("NoSuch".to_string()),
+                header: None,
                 payload: None,
             },
         );
@@ -835,6 +875,7 @@ mod tests {
                 path: Some(file_path.to_string_lossy().to_string()),
                 interval: None,
                 proxy: None,
+                header: None,
                 payload: None,
             },
         );
@@ -858,6 +899,7 @@ mod tests {
                 path: None,
                 interval: None,
                 proxy: None,
+                header: None,
                 payload: Some(vec!["example.com".to_string(), "+.foo.com".to_string()]),
             },
         );
@@ -878,6 +920,7 @@ mod tests {
             path: None,
             interval: Some(3600),
             proxy: None,
+            header: None,
             payload: Some(vec!["example.com".to_string()]),
         };
         let err = load_inline("p", &cfg, RuleSetBehavior::Domain, &ctx())
@@ -905,6 +948,7 @@ mod tests {
                 path: Some(file_path.to_string_lossy().to_string()),
                 interval: None,
                 proxy: None,
+                header: None,
                 payload: None,
             },
         );
@@ -930,6 +974,7 @@ mod tests {
                 path: Some(file_path.to_string_lossy().to_string()),
                 interval: None,
                 proxy: None,
+                header: None,
                 payload: None,
             },
         );
@@ -950,6 +995,7 @@ mod tests {
                 path: None,
                 interval: None,
                 proxy: None,
+                header: None,
                 payload: None,
             },
         );
@@ -973,6 +1019,7 @@ mod tests {
                 path: Some(file_path.to_string_lossy().to_string()),
                 interval: Some(3600),
                 proxy: None,
+                header: None,
                 payload: None,
             },
         );
@@ -1028,6 +1075,7 @@ mod tests {
                 path: None,
                 interval: None,
                 proxy: None,
+                header: None,
                 payload: None,
             },
         );
@@ -1037,6 +1085,128 @@ mod tests {
         let provider = out.get("http-test").expect("HTTP provider should load");
         assert_eq!(provider.provider_type, ProviderType::Http);
         assert_eq!(provider.rule_count(), 1);
+    }
+
+    #[test]
+    fn raw_rule_provider_deserializes_list_header() {
+        // The mihomo wiki form (map[string][]string): sequence values.
+        let yaml = r#"
+type: http
+behavior: classical
+url: "https://example.com/Google.yaml"
+header:
+  User-Agent:
+    - "mihomo/1.18.3"
+  Authorization:
+    - 'token 1231231'
+"#;
+        let raw: RawRuleProvider = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            provider_headers(&raw),
+            vec![
+                ("Authorization".to_string(), "token 1231231".to_string()),
+                ("User-Agent".to_string(), "mihomo/1.18.3".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_rule_provider_deserializes_single_string_header() {
+        // meow-rs's legacy single-string form keeps working.
+        let yaml = r#"
+type: http
+behavior: domain
+url: "https://example.com/list.yaml"
+header:
+  Authorization: "Bearer token123"
+"#;
+        let raw: RawRuleProvider = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            provider_headers(&raw),
+            vec![("Authorization".to_string(), "Bearer token123".to_string())]
+        );
+    }
+
+    /// Custom `header:` entries must reach the wire as real field lines —
+    /// one per list entry (RFC 9110 §5.2) — and a user-supplied
+    /// User-Agent must replace the built-in default (mihomo parity).
+    #[test]
+    fn http_provider_sends_custom_headers_on_the_wire() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "timed out waiting for HTTP client"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("HTTP test listener failed: {e}"),
+                }
+            };
+            // The accepted stream can inherit the listener's nonblocking flag, which
+            // would make the read/write below return `WouldBlock`. Force blocking mode.
+            stream.set_nonblocking(false).unwrap();
+            let mut buf = vec![0_u8; 2048];
+            let n = stream.read(&mut buf).unwrap();
+            assert!(n > 0, "expected an HTTP request from the client");
+            let head = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = "payload:\n  - 'example.com'\n";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            head
+        });
+
+        let mut header = HashMap::new();
+        header.insert(
+            "User-Agent".to_string(),
+            crate::raw::StringOrList::List(vec![
+                "Clash/v1.18.0".to_string(),
+                "mihomo/1.18.3".to_string(),
+            ]),
+        );
+        let mut providers = HashMap::new();
+        providers.insert(
+            "hdr-test".to_string(),
+            RawRuleProvider {
+                provider_type: "http".to_string(),
+                behavior: "domain".to_string(),
+                format: Some("yaml".to_string()),
+                url: Some(format!("http://{addr}/rules.yaml")),
+                path: None,
+                interval: None,
+                proxy: None,
+                header: Some(header),
+                payload: None,
+            },
+        );
+
+        let out = load_providers(&providers, None, &ctx(), None);
+        let head = server.join().unwrap();
+        let provider = out.get("hdr-test").expect("HTTP provider should load");
+        assert_eq!(provider.rule_count(), 1);
+        // Both list entries are on the wire as separate field lines, and the
+        // built-in default UA is suppressed (exactly two User-Agent lines).
+        assert_eq!(
+            head.lines()
+                .filter(|l| l.to_ascii_lowercase().starts_with("user-agent:"))
+                .count(),
+            2,
+            "request head: {head}"
+        );
+        assert!(head.contains("User-Agent: Clash/v1.18.0\r\n"));
+        assert!(head.contains("User-Agent: mihomo/1.18.3\r\n"));
     }
 
     #[test]
@@ -1052,6 +1222,7 @@ mod tests {
                 path: None,
                 interval: None,
                 proxy: None,
+                header: None,
                 payload: Some(vec!["example.com".to_string()]),
             },
         );
@@ -1065,6 +1236,7 @@ mod tests {
                 path: None,
                 interval: None,
                 proxy: None,
+                header: None,
                 payload: Some(vec!["10.0.0.0/8".to_string()]),
             },
         );
@@ -1142,6 +1314,7 @@ mod tests {
             path: Some(path.to_string()),
             interval: None,
             proxy: None,
+            header: None,
             payload: Some(vec!["example.com".to_string()]),
         };
 
@@ -1249,7 +1422,7 @@ mod tests {
             let _ = stream.shutdown().await;
         });
 
-        let err = fetch_http_async(&format!("http://{addr}/rules.yaml"), None)
+        let err = fetch_http_async(&format!("http://{addr}/rules.yaml"), None, &[])
             .await
             .expect_err("oversized response must be rejected");
         assert!(

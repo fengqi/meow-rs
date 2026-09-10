@@ -3163,6 +3163,7 @@ mod geoip_context_tests {
                 path: None,
                 interval: None,
                 proxy: None,
+                header: None,
                 payload: Some(vec!["GEOIP,KR".to_string(), "GEOSITE,youtube".to_string()]),
             },
         );

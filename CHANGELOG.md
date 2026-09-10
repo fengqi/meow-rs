@@ -59,6 +59,18 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **Provider `header:` maps now accept mihomo's list form, and rule-providers
+  honor `header:` at all.** mihomo types provider headers as
+  `map[string][]string` (one field line per list entry), but meow-rs typed
+  `proxy-providers` `header` as `map[string]string`, so a mihomo-style config
+  failed to load with `invalid type: sequence, expected a string`; rule
+  providers had no `header` key and silently ignored one. Both provider kinds
+  now accept the list form (single-string values keep working for
+  meow-rs-legacy configs), send multi-value headers as repeated field lines
+  (RFC 9110 §5.2) on initial load, prefetch, and periodic refresh, and a
+  user-supplied `User-Agent` replaces the built-in default instead of
+  duplicating it (mihomo parity: `component/http/http.go`).
+
 - Hysteria2 authentication no longer advertises HTTP/3 datagrams, preventing
   the server's HTTP/3 receiver from consuming raw QUIC UDP relay packets.
   The TProxy test image now includes the mandatory BoringSSL build toolchain.

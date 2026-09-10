@@ -28,7 +28,9 @@ pub struct ProxyProvider {
     exclude_type: Vec<String>,
     pub health_check: Option<HealthCheckConfig>,
     updated_at: AtomicU,
-    header: HashMap<String, String>,
+    /// Flattened custom request headers (name-sorted; one entry per value,
+    /// so multi-value headers repeat the name — RFC 9110 §5.2).
+    header: Vec<(String, String)>,
     ipv6: bool,
     /// Whether `plugin:` on provider-sourced nodes may name an external
     /// SIP003 executable. Provider content is remote-controlled; without the
@@ -189,7 +191,11 @@ impl ProxyProvider {
         let exclude_type = split_exclude_types(raw.exclude_type.as_deref());
 
         let health_check = build_health_check_config(raw.health_check.as_ref());
-        let header = raw.header.clone().unwrap_or_default();
+        let header = raw
+            .header
+            .as_ref()
+            .map(crate::raw::flatten_header_map)
+            .unwrap_or_default();
 
         Ok(Self {
             name: name.to_string(),
@@ -250,12 +256,7 @@ impl ProxyProvider {
                 )
             }),
             Vehicle::Http { url, cache_path } => {
-                let headers: Vec<(String, String)> = self
-                    .header
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                let fetched = crate::internal_http::fetch(url, None, &headers)
+                let fetched = crate::internal_http::fetch(url, None, &self.header)
                     .await
                     .and_then(|bytes| {
                         String::from_utf8(bytes)
@@ -605,7 +606,10 @@ mod tests {
     #[test]
     fn http_provider_new_with_custom_headers() {
         let mut headers = HashMap::new();
-        headers.insert("X-Token".to_string(), "secret".to_string());
+        headers.insert(
+            "X-Token".to_string(),
+            crate::raw::StringOrList::Single("secret".to_string()),
+        );
         let raw = RawProxyProvider {
             provider_type: "http".to_string(),
             url: Some("https://example.com/proxies.yaml".to_string()),
@@ -620,7 +624,48 @@ mod tests {
         };
         let p = ProxyProvider::new("airport", &raw, None, true).unwrap();
         assert_eq!(p.vehicle_type, "HTTP");
-        assert_eq!(p.header.get("X-Token").map(String::as_str), Some("secret"));
+        assert!(p
+            .header
+            .contains(&("X-Token".to_string(), "secret".to_string())));
+    }
+
+    #[test]
+    fn http_provider_new_with_multi_value_headers() {
+        // mihomo's canonical list form: one name, several values.
+        let mut headers = HashMap::new();
+        headers.insert(
+            "User-Agent".to_string(),
+            crate::raw::StringOrList::List(vec![
+                "Clash/v1.18.0".to_string(),
+                "mihomo/1.18.3".to_string(),
+            ]),
+        );
+        headers.insert(
+            "Authorization".to_string(),
+            crate::raw::StringOrList::Single("token 1231231".to_string()),
+        );
+        let raw = RawProxyProvider {
+            provider_type: "http".to_string(),
+            url: Some("https://example.com/proxies.yaml".to_string()),
+            path: None,
+            interval: None,
+            filter: None,
+            exclude_filter: None,
+            exclude_type: None,
+            health_check: None,
+            header: Some(headers),
+        };
+        let p = ProxyProvider::new("airport", &raw, None, true).unwrap();
+        // Multi-value entries repeat the name (one field line per value),
+        // sorted by name like Go net/http.
+        assert_eq!(
+            p.header,
+            vec![
+                ("Authorization".to_string(), "token 1231231".to_string()),
+                ("User-Agent".to_string(), "Clash/v1.18.0".to_string()),
+                ("User-Agent".to_string(), "mihomo/1.18.3".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -635,10 +680,45 @@ header:
         let raw: RawProxyProvider = serde_yaml::from_str(yaml).unwrap();
         let headers = raw.header.unwrap();
         assert_eq!(
-            headers.get("Authorization").map(String::as_str),
-            Some("Bearer token123")
+            headers.get("Authorization"),
+            Some(&crate::raw::StringOrList::Single(
+                "Bearer token123".to_string()
+            ))
         );
-        assert_eq!(headers.get("X-Custom").map(String::as_str), Some("value"));
+        assert_eq!(
+            headers.get("X-Custom"),
+            Some(&crate::raw::StringOrList::Single("value".to_string()))
+        );
+    }
+
+    #[test]
+    fn raw_proxy_provider_deserializes_list_header() {
+        // The mihomo wiki form: sequence values under `header:`.
+        let yaml = r#"
+type: http
+url: "https://example.com/proxies.yaml"
+header:
+  User-Agent:
+    - "Clash/v1.18.0"
+    - "mihomo/1.18.3"
+  Authorization:
+    - 'token 1231231'
+"#;
+        let raw: RawProxyProvider = serde_yaml::from_str(yaml).unwrap();
+        let headers = raw.header.unwrap();
+        assert_eq!(
+            headers.get("User-Agent"),
+            Some(&crate::raw::StringOrList::List(vec![
+                "Clash/v1.18.0".to_string(),
+                "mihomo/1.18.3".to_string(),
+            ]))
+        );
+        assert_eq!(
+            headers.get("Authorization"),
+            Some(&crate::raw::StringOrList::List(vec![
+                "token 1231231".to_string()
+            ]))
+        );
     }
 
     #[test]

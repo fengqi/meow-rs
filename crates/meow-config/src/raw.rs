@@ -1,6 +1,34 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// A `header:` map value: mihomo's `map[string][]string` list form, or the
+/// single-string form meow-rs historically accepted. A list sends one field
+/// line per value (RFC 9110 §5.2); both forms are kept so existing
+/// string-form configs keep loading while mihomo configs parse as-is.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum StringOrList {
+    Single(String),
+    List(Vec<String>),
+}
+
+/// Flatten a raw `header:` map into `(name, value)` pairs. Multi-value
+/// entries become one pair per value; pairs are sorted by name to match Go
+/// `net/http`'s on-wire header ordering (mihomo parity).
+pub(crate) fn flatten_header_map(map: &HashMap<String, StringOrList>) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = Vec::with_capacity(map.len());
+    for (name, value) in map {
+        match value {
+            StringOrList::Single(s) => pairs.push((name.clone(), s.clone())),
+            StringOrList::List(vs) => {
+                pairs.extend(vs.iter().map(|s| (name.clone(), s.clone())));
+            }
+        }
+    }
+    pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    pairs
+}
+
 fn deserialize_string_or_seq<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -417,7 +445,7 @@ pub struct RawProxyProvider {
     pub exclude_type: Option<Vec<String>>,
     pub health_check: Option<RawHealthCheck>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub header: Option<std::collections::HashMap<String, String>>,
+    pub header: Option<HashMap<String, StringOrList>>,
     /// Opt-in: allow `plugin:` fields on this provider's nodes to name
     /// external SIP003 executables. Off by default — provider content is
     /// remote-controlled and the plugin name reaches `Command::new`
@@ -461,6 +489,10 @@ pub struct RawRuleProvider {
     /// through, or `DIRECT` to force a direct fetch. Absent = the global
     /// default (the first proxy in `proxies:`, direct when none).
     pub proxy: Option<String>,
+    /// Custom HTTP request headers for http providers (mihomo
+    /// `map[string][]string`; the single-string form is also accepted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<HashMap<String, StringOrList>>,
     /// Inline payload: list of rule strings (only for type=inline).
     pub payload: Option<Vec<String>>,
 }
