@@ -1209,9 +1209,8 @@ header:
         assert!(head.contains("User-Agent: mihomo/1.18.3\r\n"));
     }
 
-    /// Review ask #3: the single-string form has a parse test but no wire
-    /// test — a lone string value must reach the wire as one field line
-    /// (and, as a UA, still replace the built-in default).
+    /// A lone string value must reach the wire as one field line (and, as
+    /// a UA, still replace the built-in default).
     #[test]
     fn http_provider_sends_single_string_header_on_the_wire() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

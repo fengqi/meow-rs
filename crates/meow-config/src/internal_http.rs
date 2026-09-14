@@ -677,9 +677,9 @@ mod tests {
         server.await.unwrap();
     }
 
-    // Review ask #1: user headers must never duplicate or override the
-    // request's framing lines — a second `Host:` is a request-smuggling
-    // primitive, a custom `Accept-Encoding: gzip` an undecodable body.
+    // User headers must never duplicate or override the request's own
+    // framing lines — a second `Host:` is a request-smuggling primitive, a
+    // custom `Accept-Encoding: gzip` an undecodable body.
     #[tokio::test]
     async fn reserved_header_names_are_dropped_at_emission() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -727,7 +727,7 @@ mod tests {
         assert!(!request.contains("content-length: 999"));
     }
 
-    // Review ask #3: the `bail!("invalid HTTP header")` guard — CRLF in a
+    // The `bail!("invalid HTTP header")` guard — CRLF in a
     // header value is a header-injection attempt, not a fetch error to
     // paper over.
     #[tokio::test]
@@ -758,12 +758,11 @@ mod tests {
         );
     }
 
-    // Review follow-up (blocking): `"Host "`, `" Host"`, `"Host\t"` are not
-    // RFC 9110 tokens, yet they passed the old CR/LF/colon-only check, missed
-    // the exact reserved-name match, and would be emitted as `Host : evil` —
-    // a parser-differential duplicate-Host smuggling input once a tolerant
-    // intermediary normalizes the whitespace. Names must be rejected, not
-    // trimmed.
+    // `"Host "`, `" Host"`, `"Host\t"` are not RFC 9110 tokens: they dodge
+    // the exact reserved-name match and would be emitted as `Host : evil`,
+    // which a tolerant intermediary can normalize into a second `Host:`
+    // line (parser-differential request smuggling). Names must be rejected,
+    // not trimmed.
     #[tokio::test]
     async fn header_names_with_padding_whitespace_are_rejected() {
         // One single-shot server per case: an invalid-header fetch still
@@ -809,9 +808,9 @@ mod tests {
         }
     }
 
-    // Secondary hardening from the review: values may only contain SP, HTAB,
-    // and visible/8-bit bytes (Go `ValidHeaderFieldValue`); other CTLs
-    // (NUL, vertical tab, DEL) are injection primitives.
+    // Values may only contain SP, HTAB, and visible/8-bit bytes (Go
+    // `ValidHeaderFieldValue`); other CTLs (NUL, vertical tab, DEL) are
+    // injection primitives.
     #[tokio::test]
     async fn header_values_with_control_characters_are_rejected() {
         for value in ["evil\u{0}x", "evil\u{0b}x", "evil\u{7f}x"] {
