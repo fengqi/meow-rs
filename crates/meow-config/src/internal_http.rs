@@ -69,6 +69,40 @@ fn is_reserved_header(name: &str) -> bool {
         .any(|reserved| name.eq_ignore_ascii_case(reserved))
 }
 
+/// RFC 9110 `tchar` set (token characters): the ONLY bytes a header field
+/// name may contain. Go's writer enforces the same via `httpguts
+/// .ValidHeaderFieldName`.
+#[inline]
+fn is_tchar(b: u8) -> bool {
+    matches!(b,
+        b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-'
+        | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+        | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z')
+}
+
+/// A valid header field name is non-empty and all-tchar. In particular this
+/// rejects whitespace around/between the name and the colon (`"Host "`,
+/// `" Host"`, `"Host\t"`, `"Ho st"`) and any non-ASCII byte: such names miss
+/// the exact-match reserved-name filter below and would be emitted as
+/// `Host : evil`, which tolerant intermediaries can normalize back to a
+/// second `Host:` line — a parser-differential request-smuggling input.
+/// Names are rejected, never trimmed/rewritten.
+#[inline]
+fn is_valid_header_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(is_tchar)
+}
+
+/// A valid header field value per RFC 9110/Go's `ValidHeaderFieldValue`:
+/// SP, HTAB, and any byte in the visible range plus 0x80..=0xFF (obs
+/// latin-1 values are tolerated, matching Go); every other CTL (including
+/// CR/LF, 0x00-0x08, 0x0A-0x1F, DEL) is rejected.
+#[inline]
+fn is_valid_header_value(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|b| b == b'\t' || (b'\x20'..=b'\x7e').contains(&b) || b >= 0x80)
+}
+
 /// Fetch `url` via `proxy` and return the response body.
 ///
 /// Follows up to 5 redirects (302/301/307/308). Returns an
@@ -216,10 +250,12 @@ async fn fetch_one(
         request.push_str("\r\n");
     }
     for (name, value) in headers {
-        if name.is_empty()
-            || name.bytes().any(|b| b == b'\r' || b == b'\n' || b == b':')
-            || value.bytes().any(|b| b == b'\r' || b == b'\n')
-        {
+        // Full RFC 9110 token validation — NOT a mere CR/LF/colon check:
+        // `"Host "`/`" Host"`/`"Host\t"` would dodge the reserved-name match
+        // below and be emitted as `Host : evil`, which tolerant intermediaries
+        // can normalize into a second `Host:` line (request smuggling).
+        // Names/values are rejected as-is, never trimmed or rewritten.
+        if !is_valid_header_name(name) || !is_valid_header_value(value) {
             bail!("invalid HTTP header {name:?}");
         }
         if is_reserved_header(name) {
@@ -720,5 +756,84 @@ mod tests {
             err.to_string().contains("invalid HTTP header"),
             "unexpected error: {err}"
         );
+    }
+
+    // Review follow-up (blocking): `"Host "`, `" Host"`, `"Host\t"` are not
+    // RFC 9110 tokens, yet they passed the old CR/LF/colon-only check, missed
+    // the exact reserved-name match, and would be emitted as `Host : evil` —
+    // a parser-differential duplicate-Host smuggling input once a tolerant
+    // intermediary normalizes the whitespace. Names must be rejected, not
+    // trimmed.
+    #[tokio::test]
+    async fn header_names_with_padding_whitespace_are_rejected() {
+        // One single-shot server per case: an invalid-header fetch still
+        // dials before bailing, so a shared server would be consumed.
+        for name in ["Host ", " Host", "Host\t", "Ho st", "Content-Length "] {
+            let url =
+                spawn_raw_http_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+            let headers = vec![(name.to_string(), "evil".to_string())];
+            let err = tokio::time::timeout(Duration::from_secs(5), fetch(&url, None, &headers))
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("invalid HTTP header"),
+                "name {name:?} should be rejected as a non-token header name: {err}"
+            );
+        }
+    }
+
+    // Non-token bytes beyond whitespace: non-ASCII (Unicode), DEL, and other
+    // separators must all be rejected too — the whole tchar table applies.
+    #[tokio::test]
+    async fn header_names_with_non_token_bytes_are_rejected() {
+        for name in [
+            "Hösí",
+            "Host\u{7f}",
+            "Host\u{0b}",
+            "()",
+            "Host\\",
+            "Host\x1f",
+        ] {
+            let url =
+                spawn_raw_http_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+            let headers = vec![(name.to_string(), "v".to_string())];
+            let err = tokio::time::timeout(Duration::from_secs(5), fetch(&url, None, &headers))
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("invalid HTTP header"),
+                "name {name:?} should be rejected as a non-token header name: {err}"
+            );
+        }
+    }
+
+    // Secondary hardening from the review: values may only contain SP, HTAB,
+    // and visible/8-bit bytes (Go `ValidHeaderFieldValue`); other CTLs
+    // (NUL, vertical tab, DEL) are injection primitives.
+    #[tokio::test]
+    async fn header_values_with_control_characters_are_rejected() {
+        for value in ["evil\u{0}x", "evil\u{0b}x", "evil\u{7f}x"] {
+            let url =
+                spawn_raw_http_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+            let headers = vec![("X-Test".to_string(), value.to_string())];
+            let err = tokio::time::timeout(Duration::from_secs(5), fetch(&url, None, &headers))
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("invalid HTTP header"),
+                "value {value:?} should be rejected: {err}"
+            );
+        }
+        // SP and HTAB ARE legal field-value bytes — round-trip one.
+        let url = spawn_raw_http_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+        let headers = vec![("X-Test".to_string(), "a \t b".to_string())];
+        let body = tokio::time::timeout(Duration::from_secs(5), fetch(&url, None, &headers))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(body, b"ok");
     }
 }

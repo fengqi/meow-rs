@@ -77,7 +77,12 @@ the canonical, in-repo source a release is cut from.
   rest of the hop-by-hop set) are dropped at emission rather than written,
   mirroring Go `net/http`'s `reqWriteExcludeHeader` — a second `Host:` or
   `Content-Length:` line is a request-smuggling primitive
-  (mihomo parity: `component/http/http.go`). Note: non-string header values
+  (mihomo parity: `component/http/http.go`). Header field names and values
+  are validated per RFC 9110 (token-only names, CTL-free values) rather
+  than only checking CR/LF/colon, so padded names like `Host ` / ` Host` /
+  `Host\t` — which could dodge the reserved-name match and be normalized by
+  tolerant intermediaries into a duplicate `Host:` line — are now rejected
+  instead of emitted. Note: non-string header values
   (e.g. `header: {X: 123}`) were previously coerced to `"123"` on API-pushed
   configs and are now rejected, matching mihomo.
 
