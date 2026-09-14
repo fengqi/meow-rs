@@ -61,15 +61,25 @@ the canonical, in-repo source a release is cut from.
 
 - **Provider `header:` maps now accept mihomo's list form, and rule-providers
   honor `header:` at all.** mihomo types provider headers as
-  `map[string][]string` (one field line per list entry), but meow-rs typed
-  `proxy-providers` `header` as `map[string]string`, so a mihomo-style config
-  failed to load with `invalid type: sequence, expected a string`; rule
-  providers had no `header` key and silently ignored one. Both provider kinds
-  now accept the list form (single-string values keep working for
-  meow-rs-legacy configs), send multi-value headers as repeated field lines
-  (RFC 9110 §5.2) on initial load, prefetch, and periodic refresh, and a
-  user-supplied `User-Agent` replaces the built-in default instead of
-  duplicating it (mihomo parity: `component/http/http.go`).
+  `map[string][]string`, but meow-rs typed `proxy-providers` `header` as
+  `map[string]string`, so a mihomo-style config failed to load with
+  `invalid type: sequence, expected a string`; rule providers had no
+  `header` key and silently ignored one. Both provider kinds now accept the
+  list form (single-string values keep working for meow-rs-legacy configs)
+  and send multi-value headers as repeated field lines (RFC 9110 §5.2; meow
+  emits every list value, whereas Go's HTTP/1.1 writer special-cases
+  `User-Agent` to its first value). Headers apply to rule-provider initial
+  load, prefetch, and periodic refresh, and to proxy-provider load (a
+  proxy-provider `interval` is parsed but not scheduled, so those providers
+  have no periodic refresh yet). A user-supplied `User-Agent` replaces the
+  built-in default instead of duplicating it, and reserved/framing header
+  names (`Host`, `Connection`, `Content-Length`, `Accept-Encoding`, and the
+  rest of the hop-by-hop set) are dropped at emission rather than written,
+  mirroring Go `net/http`'s `reqWriteExcludeHeader` — a second `Host:` or
+  `Content-Length:` line is a request-smuggling primitive
+  (mihomo parity: `component/http/http.go`). Note: non-string header values
+  (e.g. `header: {X: 123}`) were previously coerced to `"123"` on API-pushed
+  configs and are now rejected, matching mihomo.
 
 - Hysteria2 authentication no longer advertises HTTP/3 datagrams, preventing
   the server's HTTP/3 receiver from consuming raw QUIC UDP relay packets.

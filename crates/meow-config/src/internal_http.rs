@@ -25,6 +25,7 @@ use smol_str::SmolStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tracing::debug;
 use url::Url;
 
 const MAX_REDIRECTS: u8 = 5;
@@ -39,6 +40,34 @@ const USER_AGENT: &str = concat!("clash.meta/", env!("CARGO_PKG_VERSION"));
 pub(crate) const MAX_BODY_BYTES: usize = 256 * 1024 * 1024; // 256 MiB hard ceiling
 /// Headroom on top of the body cap for the status line + headers.
 const MAX_HEADER_BYTES: usize = 64 * 1024;
+
+/// Header names this client writes itself or that frame the request, so a
+/// user-supplied entry with one of these names is dropped instead of emitted
+/// (RFC 9110 §7.6.1 hop-by-hop set plus the framing lines `fetch_one`
+/// controls). Mirrors Go `net/http`'s `reqWriteExcludeHeader`: a second
+/// `Host:`/`Content-Length:` line is a request-smuggling primitive, and a
+/// configured `Accept-Encoding: gzip` would return an undecodable body.
+/// `User-Agent` is not listed — it is handled by replace semantics instead.
+const RESERVED_HEADER_NAMES: [&str; 12] = [
+    "host",
+    "connection",
+    "content-length",
+    "accept-encoding",
+    "transfer-encoding",
+    "trailer",
+    "te",
+    "upgrade",
+    "keep-alive",
+    "proxy-connection",
+    "proxy-authenticate",
+    "proxy-authorization",
+];
+
+fn is_reserved_header(name: &str) -> bool {
+    RESERVED_HEADER_NAMES
+        .iter()
+        .any(|reserved| name.eq_ignore_ascii_case(reserved))
+}
 
 /// Fetch `url` via `proxy` and return the response body.
 ///
@@ -192,6 +221,15 @@ async fn fetch_one(
             || value.bytes().any(|b| b == b'\r' || b == b'\n')
         {
             bail!("invalid HTTP header {name:?}");
+        }
+        if is_reserved_header(name) {
+            // mihomo parity (net/http reqWriteExcludeHeader): never let a
+            // user header duplicate or override the request's own framing
+            // lines — a second `Host:`/`Content-Length:` is a classic
+            // request-smuggling primitive, and a configured
+            // `Accept-Encoding: gzip` would return a body meow can't decode.
+            debug!("ignoring reserved provider header {name:?}");
+            continue;
         }
         request.push_str(name);
         request.push_str(": ");
@@ -601,5 +639,86 @@ mod tests {
             .unwrap();
         assert_eq!(body, b"ok");
         server.await.unwrap();
+    }
+
+    // Review ask #1: user headers must never duplicate or override the
+    // request's framing lines — a second `Host:` is a request-smuggling
+    // primitive, a custom `Accept-Encoding: gzip` an undecodable body.
+    #[tokio::test]
+    async fn reserved_header_names_are_dropped_at_emission() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/rules.yaml", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            request
+        });
+        let headers = [
+            ("Host", "evil.example.com"),
+            ("Content-Length", "999"),
+            ("Accept-Encoding", "gzip"),
+            ("Connection", "keep-alive"),
+            ("X-Custom", "kept"),
+        ]
+        .map(|(name, value)| (name.to_string(), value.to_string()));
+        let body = tokio::time::timeout(Duration::from_secs(5), fetch(&url, None, &headers))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(body, b"ok");
+        let request = server.await.unwrap();
+        // Custom non-reserved header reaches the wire...
+        assert!(request.contains("x-custom: kept\r\n"));
+        // ...but each framing line appears exactly once, with this
+        // client's own value — the configured ones never made it out.
+        assert_eq!(
+            request.lines().filter(|l| l.starts_with("host:")).count(),
+            1
+        );
+        assert!(request.contains("accept-encoding: identity\r\n"));
+        assert_eq!(
+            request
+                .lines()
+                .filter(|l| l.starts_with("accept-encoding:"))
+                .count(),
+            1
+        );
+        assert!(request.contains("connection: close\r\n"));
+        assert!(!request.contains("content-length: 999"));
+    }
+
+    // Review ask #3: the `bail!("invalid HTTP header")` guard — CRLF in a
+    // header value is a header-injection attempt, not a fetch error to
+    // paper over.
+    #[tokio::test]
+    async fn header_values_with_crlf_are_rejected() {
+        let url = spawn_raw_http_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+        let headers = vec![("X-Bad".to_string(), "evil\r\nHost: injected".to_string())];
+        let err = tokio::time::timeout(Duration::from_secs(5), fetch(&url, None, &headers))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid HTTP header"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn header_names_with_colons_are_rejected() {
+        let url = spawn_raw_http_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+        let headers = vec![("X-Bad:injected".to_string(), "v".to_string())];
+        let err = tokio::time::timeout(Duration::from_secs(5), fetch(&url, None, &headers))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid HTTP header"),
+            "unexpected error: {err}"
+        );
     }
 }

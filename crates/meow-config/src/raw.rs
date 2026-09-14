@@ -25,7 +25,10 @@ pub(crate) fn flatten_header_map(map: &HashMap<String, StringOrList>) -> Vec<(St
             }
         }
     }
-    pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    // Stable sort: same-name entries keep their declared value order (Go's
+    // net/http preserves per-name value order; an unstable sort doesn't
+    // contractually).
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
     pairs
 }
 

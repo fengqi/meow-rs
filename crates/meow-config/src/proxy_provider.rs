@@ -505,8 +505,8 @@ mod tests {
             exclude_filter: None,
             exclude_type: None,
             health_check: None,
-            header: None,
             allow_external_plugin: None,
+            header: None,
         }
     }
 
@@ -553,8 +553,8 @@ mod tests {
             exclude_filter: None,
             exclude_type: None,
             health_check: None,
-            header: None,
             allow_external_plugin: None,
+            header: None,
         };
         let Err(err) = ProxyProvider::new("test", &raw, Some(dir.path()), true) else {
             panic!("escaping http cache path must be rejected");
@@ -594,8 +594,8 @@ mod tests {
                 exclude_filter: None,
                 exclude_type: None,
                 health_check: None,
-                header: None,
                 allow_external_plugin: None,
+                header: None,
             },
         );
         validate_paths(&map, Some(dir.path())).expect("contained paths must validate");
@@ -619,8 +619,8 @@ mod tests {
             exclude_filter: None,
             exclude_type: None,
             health_check: None,
-            header: Some(headers),
             allow_external_plugin: None,
+            header: Some(headers),
         };
         let p = ProxyProvider::new("airport", &raw, None, true).unwrap();
         assert_eq!(p.vehicle_type, "HTTP");
@@ -653,6 +653,7 @@ mod tests {
             exclude_filter: None,
             exclude_type: None,
             health_check: None,
+            allow_external_plugin: None,
             header: Some(headers),
         };
         let p = ProxyProvider::new("airport", &raw, None, true).unwrap();
